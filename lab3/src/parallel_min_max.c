@@ -9,6 +9,8 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <fcntl.h>
+#include <errno.h>
 
 #include <getopt.h>
 
@@ -41,29 +43,29 @@ int main(int argc, char **argv) {
           case 0:
             seed = atoi(optarg);
             if (seed <= 0) {
-		printf("seed must be a positive number\n");
-		return 1;
+              fprintf(stderr, "seed must be positive\n");
+              return 1;
             }
             break;
           case 1:
             array_size = atoi(optarg);
             if (array_size <= 0) {
-		printf("array_size must be a positive number\n");
-		return 1;
-	    }
+              fprintf(stderr, "array_size must be positive\n");
+              return 1;
+            }
             break;
           case 2:
             pnum = atoi(optarg);
             if (pnum <= 0) {
-		printf("pnum must be a positive number\n");
-		return 1;
-	    }
+              fprintf(stderr, "pnum must be positive\n");
+              return 1;
+            }
             break;
           case 3:
             with_files = true;
             break;
 
-          defalut:
+          default:
             printf("Index %d is out of options\n", option_index);
         }
         break;
@@ -85,14 +87,45 @@ int main(int argc, char **argv) {
   }
 
   if (seed == -1 || array_size == -1 || pnum == -1) {
-    printf("Usage: %s --seed \"num\" --array_size \"num\" --pnum \"num\" \n",
+    printf("Usage: %s --seed \"num\" --array_size \"num\" --pnum \"num\" [--by_files]\n",
            argv[0]);
     return 1;
   }
 
+  if (pnum > array_size) {
+    fprintf(stderr, "pnum should not be greater than array_size\n");
+    return 1;
+  }
+
   int *array = malloc(sizeof(int) * array_size);
+  if (!array) {
+    perror("malloc");
+    return 1;
+  }
   GenerateArray(array, array_size, seed);
   int active_child_processes = 0;
+
+  int (*pipes)[2] = NULL;
+  if (!with_files) {
+    pipes = malloc(sizeof(int[2]) * pnum);
+    if (!pipes) {
+      perror("malloc pipes");
+      free(array);
+      return 1;
+    }
+    for (int i = 0; i < pnum; i++) {
+      if (pipe(pipes[i]) == -1) {
+        perror("pipe");
+        for (int j = 0; j < i; j++) {
+          close(pipes[j][0]);
+          close(pipes[j][1]);
+        }
+        free(pipes);
+        free(array);
+        return 1;
+      }
+    }
+  }
 
   struct timeval start_time;
   gettimeofday(&start_time, NULL);
@@ -100,30 +133,63 @@ int main(int argc, char **argv) {
   for (int i = 0; i < pnum; i++) {
     pid_t child_pid = fork();
     if (child_pid >= 0) {
-      // successful fork
       active_child_processes += 1;
       if (child_pid == 0) {
-        // child process
+        int portion_size = array_size / pnum;
+        int begin = i * portion_size;
+        int end = (i == pnum - 1) ? array_size : begin + portion_size;
 
-        // parallel somehow
+        struct MinMax mm = GetMinMax(array, begin, end);
 
         if (with_files) {
-          // use files here
+          char filename[256];
+          snprintf(filename, sizeof(filename), "tmp_min_max_%d.txt", i);
+          FILE *f = fopen(filename, "w");
+          if (!f) {
+            fprintf(stderr, "Child %d: fopen failed: %s\n", i, strerror(errno));
+            _exit(1);
+          }
+          fprintf(f, "%d %d\n", mm.min, mm.max);
+          fclose(f);
         } else {
-          // use pipe here
+          close(pipes[i][0]);
+          
+          if (write(pipes[i][1], &mm.min, sizeof(mm.min)) == -1) {
+            _exit(1);
+          }
+          if (write(pipes[i][1], &mm.max, sizeof(mm.max)) == -1) {
+            _exit(1);
+          }
+          close(pipes[i][1]);
         }
-        return 0;
+        _exit(0);
+      } else {
+        if (!with_files) {
+          close(pipes[i][1]);
+        }
       }
 
     } else {
       printf("Fork failed!\n");
+      if (!with_files && pipes) {
+        for (int j = 0; j < pnum; j++) {
+          close(pipes[j][0]);
+          close(pipes[j][1]);
+        }
+        free(pipes);
+      }
+      free(array);
       return 1;
     }
   }
 
   while (active_child_processes > 0) {
-    // your code here
-
+    int status = 0;
+    pid_t w = wait(&status);
+    if (w == -1) {
+      perror("wait");
+      break;
+    }
     active_child_processes -= 1;
   }
 
@@ -132,17 +198,45 @@ int main(int argc, char **argv) {
   min_max.max = INT_MIN;
 
   for (int i = 0; i < pnum; i++) {
-    int min = INT_MAX;
-    int max = INT_MIN;
+    int local_min = INT_MAX;
+    int local_max = INT_MIN;
 
     if (with_files) {
-      // read from files
+      char filename[256];
+      snprintf(filename, sizeof(filename), "tmp_min_max_%d.txt", i);
+      FILE *f = fopen(filename, "r");
+      if (!f) {
+        fprintf(stderr, "Parent: fopen %s failed: %s\n", filename, strerror(errno));
+        continue;
+      }
+      if (fscanf(f, "%d %d", &local_min, &local_max) != 2) {
+        fprintf(stderr, "Parent: fscanf %s failed\n", filename);
+      }
+      fclose(f);
+      remove(filename);
     } else {
-      // read from pipes
+      ssize_t r;
+      r = read(pipes[i][0], &local_min, sizeof(local_min));
+      if (r != sizeof(local_min)) {
+        if (r == 0) {
+          fprintf(stderr, "Parent: pipe %d: unexpected EOF when reading min\n", i);
+        } else {
+          perror("read min from pipe");
+        }
+      }
+      r = read(pipes[i][0], &local_max, sizeof(local_max));
+      if (r != sizeof(local_max)) {
+        if (r == 0) {
+          fprintf(stderr, "Parent: pipe %d: unexpected EOF when reading max\n", i);
+        } else {
+          perror("read max from pipe");
+        }
+      }
+      close(pipes[i][0]);
     }
 
-    if (min < min_max.min) min_max.min = min;
-    if (max > min_max.max) min_max.max = max;
+    if (local_min < min_max.min) min_max.min = local_min;
+    if (local_max > min_max.max) min_max.max = local_max;
   }
 
   struct timeval finish_time;
@@ -151,6 +245,7 @@ int main(int argc, char **argv) {
   double elapsed_time = (finish_time.tv_sec - start_time.tv_sec) * 1000.0;
   elapsed_time += (finish_time.tv_usec - start_time.tv_usec) / 1000.0;
 
+  if (pipes) free(pipes);
   free(array);
 
   printf("Min: %d\n", min_max.min);
